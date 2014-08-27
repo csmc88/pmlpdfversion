@@ -1,0 +1,303 @@
+Coursera PML Project
+========================================================
+
+This project focuses on building a Machine Learning model of user activity performance using multiple accelerometer measurements. I explain my thought process using machine learning concepts.
+
+The purpose of this model is to correctly classify new observations.
+
+```{r Initialize Libraries, echo = FALSE}
+suppressWarnings(suppressMessages(library(caret)))
+suppressWarnings(suppressMessages(library(gplots)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library(reshape2)))
+suppressWarnings(suppressMessages(library(rpart)))
+suppressWarnings(suppressMessages(library(randomForest)))
+#suppressWarnings(suppressMessages(library(doParallel)))
+suppressWarnings(suppressMessages(library(gbm)))
+suppressWarnings(suppressMessages(library(ipred)))
+suppressWarnings(suppressMessages(library(plyr)))
+```
+
+## Loading and Cleaning Data
+
+```{r Loading Data}
+options(warn=-1)
+
+dataset <- read.table('data/pml-training.csv', 
+                      sep = ',', 
+                      header = TRUE, 
+                      stringsAsFactors = FALSE, 
+                      na.strings = c('','NA','#DIV/0!'))
+
+# Table of Complete (No NA Values) vs Incomplete Rows (At least 1 NA Value)
+table(complete.cases(dataset))
+
+# Number of Columns with X% of NA Values
+colNAs <- colSums(is.na(dataset))
+percents<- table(colNAs/nrow(dataset))
+percentNames <- round(as.numeric(names(percents))*100,2)
+percentNames <- paste0(percentNames,'%')
+names(percents) <- percentNames
+percents
+```
+
+The previous tables show no complete observations highly influenced by columns composed almost entirely of NA. Data imputation is ruled out for these columns.
+
+```{r Eliminate Invalid Columns}
+dataset <- dataset[colNAs == 0]
+
+nonMeasures <- 1:7
+dataset <- dataset[-nonMeasures]
+dataset$classe <- factor(dataset$classe)
+```
+
+Tree models will be used for this classification problem. Features such as timestamp, user and window are useless and might cause bias and should be removed.
+
+**NOTE: Exercises were performed sequentially, so a timestamp or index (factor) value would bias the model.**
+
+Final dataset has 52 numeric covariates, 1 factor target and 0 NA values. **No further pre process is required. Transformation of variables with tree models has little to no effect.**
+
+## Split Data
+
+I chose a 60%/20%/20% split for training, testing and validation sets. Training to create the model; Testing to select a model with best accuracy; Validation to estimate the Out of Sample Error.
+
+```{r Split Datasets}
+set.seed(1961927)
+inValidate <- createDataPartition(dataset$classe, p = 0.2, list = FALSE)
+
+validation <- dataset[inValidate,]
+dataset <- dataset[-inValidate,]
+
+inTrain <- createDataPartition(dataset$classe, p = 0.75, list = FALSE)
+training <- dataset[inTrain,]
+testing <- dataset[-inTrain,]
+```
+
+## Exploratory Data Analysis
+
+All scatterplots of Xi vs Xj with classe as color were analyzed. All presented complex behaviors. 1326 plots were generated. I present only one of such plots.
+
+```{r All Scatterplots, echo=FALSE}
+#library(ggplot2)
+#colNames <- names(training)
+#for(i in 1:51){
+#  for(j in (i+1):52){
+#    fname <- paste0(colNames[i],' to ',colNames[j], '.png')
+#    g <- ggplot(training, aes(x = training[,i], y = training[,j], colour = #classe, size = 2)) + geom_point()
+#    ggsave(file.path('figures',fname), g)
+#  }
+#}
+
+ggplot(dataset, aes(x = yaw_arm , y = magnet_arm_z, colour = classe, size = 2)) + geom_point()
+
+```
+
+The plot shows incorrect performances around the correct ones.
+
+```{r Corrplot and Heatmap on Scaled, echo=FALSE}
+#The following graph is a correlation plot between variables.
+#library(corrplot)
+#correlations <- cor(training[,-53])
+#corrplot(correlations, title = 'Correlation Plot - Training')
+
+#library(gplots)
+heatmap.2(scale(training[,-53]), main = 'Heatmap with HClust Sorting')
+```
+
+The heatmap on scaled data is difficult to read entirely and several columns appear as noise. However, multiple subgroups means there are observable differences and behaviors between samples and columns which a tree can take advantage of.
+
+## Tree Models Selected
+
+I have chosen to use tree models listed below. 
+* CART (`rpart`)
+* RandomForest (`rf`)
+* Bagging Trees (`treebag`)
+* Gradient Boosting Machine (`gbm`)
+* Combined Estimation of All (Vote Mode)
+
+If I combine multiple models this way I should use an odd number of models. Worst case scenario however is that each model gets a different answer out of 5 possible. I should properly use at least 7 models. Computational limitations restrict me to 4. This should help avoid worst case scenario.
+
+## Cross Validation (CV)
+
+Data is sorted by `classe` so K-Fold CV is not recommened because it would only study a handful of classes. Possible choices fall upon LOOCV and boot.
+
+LOOCV is computationally intensive and boot can underestimate the error. We can adjust the latter with boot-632 and the validation set.
+
+```{r Train Control}
+#controlTrain <- trainControl(method = 'boot632', number = 25)
+controlTrain <- trainControl(method = 'boot632', number = 15)
+#controlTrain <- trainControl(method = 'repeatedcv', number=10, repeats=2)
+
+```
+
+Compute all models with training data.
+
+```{r Compute All Models}
+modelCRT <- train(classe ~ . , training, method = 'rpart', 
+                  trControl = controlTrain)
+
+#Faster RF execution, parallel multi thread
+#cl <- makePSOCKcluster(4)
+#clusterEvalQ(cl, library(foreach))
+#registerDoParallel(cl)
+modelRFS <- train(classe ~ . , training, method = 'rf', 
+                  trControl = controlTrain)
+#closeAllConnections()
+
+modelBTS <- train(classe ~ . , training, method = 'treebag', 
+                  trControl = controlTrain)
+
+#GBM Uses a lot of RAM (Breaking Execution, reduced it's tuning parameters)
+gbmGrid <-  expand.grid(n.trees = c(150), 
+                        shrinkage=c(0.1),
+                        interaction.depth=c(5))
+modelGBM <- train(classe ~ . , training, method = 'gbm', verbose = FALSE,
+                  trControl = controlTrain, tuneGrid = gbmGrid)
+
+models <- list(CRT = modelCRT,
+               RFS = modelRFS,
+               BTS = modelBTS,
+               GBM = modelGBM)
+```
+
+Model combination uses a custom mode function.
+
+```{r voteFN and modeFN}
+voteFN <- function(predictions){
+  #predictions <- do.call(cbind, predictions)
+  return(apply(predictions, 1, modeFN))
+}
+
+modeFN <- function(values){
+  temp <- table(values)
+  return(names(temp)[which.max(temp)])
+}
+```
+
+Predictions are compute for each model over training, testing and validation sets.
+
+```{r Predictions on All Sets}
+
+#Training
+trainPred <- data.frame(real = training$classe)
+trainPred$CRT <- predict(modelCRT, newdata = training)
+trainPred$RFS <- predict(modelRFS, newdata = training)
+trainPred$BTS <- predict(modelBTS, newdata = training)
+trainPred$GBM <- predict(modelGBM, newdata = training)
+trainPred$ALL <- voteFN(trainPred[-1])
+
+#Testing
+testPred <- data.frame(real = testing$classe)
+testPred$CRT <- predict(modelCRT, newdata = testing)
+testPred$RFS <- predict(modelRFS, newdata = testing)
+testPred$BTS <- predict(modelBTS, newdata = testing)
+testPred$GBM <- predict(modelGBM, newdata = testing)
+testPred$ALL <- voteFN(testPred[-1])
+
+#Validation
+validPred <- data.frame(real = validation$classe)
+validPred$CRT <- predict(modelCRT, newdata = validation)
+validPred$RFS <- predict(modelRFS, newdata = validation)
+validPred$BTS <- predict(modelBTS, newdata = validation)
+validPred$GBM <- predict(modelGBM, newdata = validation)
+validPred$ALL <- voteFN(validPred[-1])
+```
+
+I use a custom accuracy evaluation.
+
+```{r MyAccuracy}
+MyAccuracy <- function(preds){
+  realValues <- preds[,1]
+  output <- sapply(preds[-1], function(x) x == realValues)
+  return(colSums(output)/nrow(preds))
+}
+```
+
+I select the best model out of accuracy in testing set.
+
+```{r Validation Phase}
+trainAcc <- MyAccuracy(trainPred)
+testAcc  <- MyAccuracy(testPred)
+validAcc <- MyAccuracy(validPred)
+
+#Find Maximum Accuracy Model on Testing Data
+bestModelPos <- which.max(testAcc)
+bestModelName <- names(testAcc)[bestModelPos]
+
+#Error Estimation
+AccuracyALL <- data.frame(training = trainAcc, 
+                          testing = testAcc, 
+                          validation = validAcc)
+
+#Accuracy for Best Model in Train / Test / Validation
+AccuracyALL[bestModelPos,]
+
+# Confusion Matrix of Best Model vs Real Test Classe
+confusionMatrix(data = testPred[, bestModelPos + 1], 
+                reference = testing$classe)$table
+```
+
+Best model was `r bestModelName` which showed good results even taking into account that overfitting was high during training. It did well on testing and validation.
+
+**Another model might seem more effective overall, but given Machine Learning concepts we can't change the model by considering the validation set "part of the training or selection".**
+
+```{r All Accuracies Plot, echo=FALSE}
+# All accuracies for Comparison
+#AccuracyALL
+#library(reshape2)
+#library(ggplot2)
+AccuracyALL$ModelNames <- rownames(AccuracyALL)
+modelErrors <- melt(AccuracyALL, id = 'ModelNames')
+
+g <- ggplot(modelErrors, aes(x = variable, y = value, colour = ModelNames))
+g <- g + geom_point(size = 4) + ggtitle("Observed Accuracy per Model")
+g
+```
+
+I expected the ALL model to be better. It could be that CART or some other model affected it. For future reference, CART might be a bad choice for model combination with other more efficient models.
+
+## Coursera Test
+**I expect the error rate on the Coursera 20 Values assigment to be closely similar to what I observed in my validation set, since it is a similar scenario and I obtained a near 100% accuracy on prediction.**
+
+```{r Coursera Function, echo=FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+```
+
+I proceed to load the Coursera testing data.
+
+```{r Load Coursera Test}
+courseraTest <- read.table('data/pml-testing.csv',
+                           sep = ',', 
+                           header = TRUE, 
+                           stringsAsFactors = FALSE, 
+                           na.strings = c('','NA','#DIV/0!'))
+if(bestModelName == 'ALL'){
+  projectAnswers <- lapply(models, function(x) predict(x, courseraTest))
+  projectAnswers <- do.call(cbind.data.frame, projectAnswers)
+  projectAnswers <- voteFN(projectAnswers)
+}else{
+  projectAnswers <- predict(models[[bestModelName]], courseraTest)
+  projectAnswers <- as.character(projectAnswers)
+}
+
+
+pml_write_files(projectAnswers)
+
+```
+
+## Conclusions
+
+I can't compute the error for the Coursera Test set. I can only trust my work and model usage to behave similarly (although possible above or below it) as it did with the validation set (but the value should be lower than with the training set).
+
+## Improvements
+
+* Change boot-632 with Stratified K Fold Cross Validation.
+
+* Explore more modeling options or machine learning algorithms, other tree ensembles or modified versions of the ones used in this document.
