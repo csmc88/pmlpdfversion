@@ -1,0 +1,16 @@
+I promised this file early and I'm sorry for being late.
+
+The GH Pages worked nice so I'm not worried other than having my word questioned.
+
+I forgot this computer didn't had MikTex (and it also had an old Version of RStudio)
+
+It was real late when I realized that. Sorry for inconveniences if any arised.
+
+Anyway, you may check against the other repos to confirm these are all exactly the same file.
+
+PDF might just be a more standard format to share documents in my opinion
+
+
+Have a good week! And I hope you like my work
+
+=)
